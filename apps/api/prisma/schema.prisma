@@ -1,0 +1,559 @@
+// Warehouse Management System — model danych
+// Kwoty przechowywane są w groszach (Int), ilości w jednostkach bazowych produktu (Int).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Użytkownicy ────────────────────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  MANAGER
+  OPERATOR
+  ACCOUNTANT
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         Role     @default(OPERATOR)
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  movements          StockMovement[]
+  receiptsCreated    GoodsReceipt[]      @relation("ReceiptCreatedBy")
+  receiptEntries     ReceiptEntry[]
+  issuesCreated      GoodsIssue[]        @relation("IssueCreatedBy")
+  invoicesCreated    Invoice[]           @relation("InvoiceCreatedBy")
+  tasksCreated       ReplenishmentTask[] @relation("TaskCreatedBy")
+  tasksCompleted     ReplenishmentTask[] @relation("TaskCompletedBy")
+  alertsAcknowledged StockAlert[]
+}
+
+// ─── Dane firmy (sprzedawca na fakturach) ───────────────────────────────────
+
+model CompanySettings {
+  id                Int     @id @default(1)
+  name              String
+  nip               String
+  street            String
+  postalCode        String
+  city              String
+  bankAccount       String?
+  bankName          String?
+  email             String?
+  phone             String?
+  invoicePaymentDays Int    @default(14)
+  expiryWarningDays Int     @default(30)
+}
+
+// ─── Kontrahenci ────────────────────────────────────────────────────────────
+
+enum ContractorType {
+  SUPPLIER
+  CUSTOMER
+  BOTH
+}
+
+model Contractor {
+  id         String         @id @default(cuid())
+  type       ContractorType
+  name       String
+  shortName  String?
+  nip        String?
+  street     String?
+  postalCode String?
+  city       String?
+  country    String         @default("PL")
+  email      String?
+  phone      String?
+  paymentDays Int?
+  active     Boolean        @default(true)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  receipts GoodsReceipt[]
+  issues   GoodsIssue[]
+  invoices Invoice[]
+
+  @@index([type])
+}
+
+// ─── Produkty ───────────────────────────────────────────────────────────────
+
+enum ProductUnit {
+  PCS
+  PACK
+  ROLL
+  SET
+  KG
+}
+
+model Product {
+  id             String      @id @default(cuid())
+  sku            String      @unique
+  ean            String?     @unique
+  name           String
+  description    String?
+  category       String?
+  unit           ProductUnit @default(PCS)
+  /// cena zakupu katalogowa (netto, grosze)
+  purchasePrice  Int         @default(0)
+  /// średni ważony koszt zakupu (netto, grosze) — aktualizowany przy przyjęciu
+  avgCost        Int         @default(0)
+  /// cena sprzedaży (netto, grosze)
+  salePrice      Int         @default(0)
+  vatRate        Int         @default(23)
+  /// próg alertu: łączny stan poniżej tej wartości generuje alert
+  minStock       Int         @default(0)
+  /// sugerowana ilość zamówienia przy alercie
+  reorderQty     Int         @default(0)
+  unitsPerCarton Int?
+  unitsPerPallet Int?
+  /// materiał opakowaniowy (np. kartony) — zużywany wewnętrznie
+  isPackaging    Boolean     @default(false)
+  trackBatches   Boolean     @default(false)
+  active         Boolean     @default(true)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  pickFaces          PickFace[]
+  stock              StockItem[]
+  movements          StockMovement[]
+  receiptLines       GoodsReceiptLine[]
+  issueLines         GoodsIssueLine[]
+  invoiceLines       InvoiceLine[]
+  alerts             StockAlert[]
+  replenishmentTasks ReplenishmentTask[]
+
+  @@index([category])
+}
+
+// ─── Lokalizacje ────────────────────────────────────────────────────────────
+
+enum LocationType {
+  RECEIVING
+  STORAGE
+  PICKING
+  SHIPPING
+  QUARANTINE
+}
+
+model Location {
+  id         String       @id @default(cuid())
+  code       String       @unique
+  name       String?
+  zone       String
+  type       LocationType
+  maxPallets Int?
+  active     Boolean      @default(true)
+  createdAt  DateTime     @default(now())
+
+  pickFaces     PickFace[]
+  stock         StockItem[]
+  handlingUnits HandlingUnit[]
+  movementsFrom StockMovement[]     @relation("MovementFrom")
+  movementsTo   StockMovement[]     @relation("MovementTo")
+  tasksFrom     ReplenishmentTask[] @relation("TaskFrom")
+  tasksTo       ReplenishmentTask[] @relation("TaskTo")
+
+  @@index([type])
+}
+
+/// Miejsce kompletacji produktu z parametrami uzupełniania (min/max)
+model PickFace {
+  id         String   @id @default(cuid())
+  productId  String
+  locationId String
+  minQty     Int
+  maxQty     Int
+  createdAt  DateTime @default(now())
+
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, locationId])
+}
+
+// ─── Jednostki logistyczne (palety / kartony) ───────────────────────────────
+
+enum HandlingUnitType {
+  PALLET
+  CARTON
+}
+
+enum HandlingUnitStatus {
+  ACTIVE
+  EMPTY
+}
+
+model HandlingUnit {
+  id         String             @id @default(cuid())
+  /// numer LPN / SSCC (18 cyfr)
+  code       String             @unique
+  type       HandlingUnitType
+  status     HandlingUnitStatus @default(ACTIVE)
+  /// paleta matczyna (dla kartonów / palet podrzędnych)
+  parentId   String?
+  locationId String?
+  receiptId  String?
+  createdAt  DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
+
+  parent    HandlingUnit?   @relation("HandlingUnitTree", fields: [parentId], references: [id])
+  children  HandlingUnit[]  @relation("HandlingUnitTree")
+  location  Location?       @relation(fields: [locationId], references: [id])
+  receipt   GoodsReceipt?   @relation(fields: [receiptId], references: [id])
+  stock     StockItem[]
+  movements StockMovement[]
+  entries   ReceiptEntry[]
+  tasks     ReplenishmentTask[]
+
+  @@index([parentId])
+  @@index([locationId])
+}
+
+// ─── Stany magazynowe ───────────────────────────────────────────────────────
+
+model StockItem {
+  id             String    @id @default(cuid())
+  /// klucz unikalności: produkt|lokalizacja|jednostka|partia|data ważności
+  stockKey       String    @unique
+  productId      String
+  locationId     String
+  handlingUnitId String?
+  batch          String?
+  expiryDate     DateTime?
+  quantity       Int
+  receivedAt     DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  product      Product       @relation(fields: [productId], references: [id])
+  location     Location      @relation(fields: [locationId], references: [id])
+  handlingUnit HandlingUnit? @relation(fields: [handlingUnitId], references: [id])
+
+  @@index([productId])
+  @@index([locationId])
+  @@index([handlingUnitId])
+}
+
+enum MovementType {
+  RECEIPT
+  PUTAWAY
+  TRANSFER
+  REPLENISHMENT
+  ISSUE
+  ADJUSTMENT_PLUS
+  ADJUSTMENT_MINUS
+  CONSUMPTION
+}
+
+model StockMovement {
+  id             String       @id @default(cuid())
+  type           MovementType
+  productId      String
+  quantity       Int
+  fromLocationId String?
+  toLocationId   String?
+  handlingUnitId String?
+  batch          String?
+  documentNo     String?
+  reason         String?
+  userId         String
+  createdAt      DateTime     @default(now())
+
+  product      Product       @relation(fields: [productId], references: [id])
+  fromLocation Location?     @relation("MovementFrom", fields: [fromLocationId], references: [id])
+  toLocation   Location?     @relation("MovementTo", fields: [toLocationId], references: [id])
+  handlingUnit HandlingUnit? @relation(fields: [handlingUnitId], references: [id])
+  user         User          @relation(fields: [userId], references: [id])
+
+  @@index([productId, createdAt])
+  @@index([createdAt])
+  @@index([type])
+}
+
+// ─── Alerty stanów ──────────────────────────────────────────────────────────
+
+enum AlertType {
+  LOW_STOCK
+  OUT_OF_STOCK
+}
+
+enum AlertStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+model StockAlert {
+  id               String      @id @default(cuid())
+  productId        String
+  type             AlertType
+  status           AlertStatus @default(OPEN)
+  threshold        Int
+  currentQty       Int
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  acknowledgedAt   DateTime?
+  acknowledgedById String?
+  resolvedAt       DateTime?
+
+  product        Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  acknowledgedBy User?   @relation(fields: [acknowledgedById], references: [id])
+
+  @@index([status])
+  @@index([productId, status])
+}
+
+// ─── Uzupełnianie (replenishment) ───────────────────────────────────────────
+
+enum TaskStatus {
+  OPEN
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  URGENT
+  HIGH
+  NORMAL
+}
+
+model ReplenishmentTask {
+  id             String       @id @default(cuid())
+  number         String       @unique
+  productId      String
+  fromLocationId String
+  toLocationId   String
+  handlingUnitId String?
+  quantity       Int
+  status         TaskStatus   @default(OPEN)
+  priority       TaskPriority @default(NORMAL)
+  createdById    String
+  completedById  String?
+  createdAt      DateTime     @default(now())
+  completedAt    DateTime?
+
+  product      Product       @relation(fields: [productId], references: [id])
+  fromLocation Location      @relation("TaskFrom", fields: [fromLocationId], references: [id])
+  toLocation   Location      @relation("TaskTo", fields: [toLocationId], references: [id])
+  handlingUnit HandlingUnit? @relation(fields: [handlingUnitId], references: [id])
+  createdBy    User          @relation("TaskCreatedBy", fields: [createdById], references: [id])
+  completedBy  User?         @relation("TaskCompletedBy", fields: [completedById], references: [id])
+
+  @@index([status])
+}
+
+// ─── Przyjęcia (PZ) ─────────────────────────────────────────────────────────
+
+enum ReceiptStatus {
+  DRAFT
+  RECEIVING
+  COMPLETED
+  CANCELLED
+}
+
+model GoodsReceipt {
+  id                String        @id @default(cuid())
+  number            String        @unique
+  supplierId        String
+  status            ReceiptStatus @default(DRAFT)
+  supplierDocNo     String?
+  expectedDate      DateTime?
+  notes             String?
+  createdById       String
+  createdAt         DateTime      @default(now())
+  completedAt       DateTime?
+  purchaseInvoiceId String?       @unique
+
+  supplier        Contractor         @relation(fields: [supplierId], references: [id])
+  createdBy       User               @relation("ReceiptCreatedBy", fields: [createdById], references: [id])
+  lines           GoodsReceiptLine[]
+  handlingUnits   HandlingUnit[]
+  purchaseInvoice Invoice?           @relation(fields: [purchaseInvoiceId], references: [id])
+
+  @@index([status])
+}
+
+model GoodsReceiptLine {
+  id          String    @id @default(cuid())
+  receiptId   String
+  productId   String
+  expectedQty Int
+  receivedQty Int       @default(0)
+  /// cena zakupu netto (grosze)
+  unitPrice   Int
+  batch       String?
+  expiryDate  DateTime?
+
+  receipt GoodsReceipt   @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  product Product        @relation(fields: [productId], references: [id])
+  entries ReceiptEntry[]
+}
+
+enum ReceiptMode {
+  PIECE
+  PALLET
+  MIXED_PALLET
+}
+
+/// Pojedyncza operacja przyjęcia (skan / zaksięgowanie partii towaru)
+model ReceiptEntry {
+  id             String      @id @default(cuid())
+  lineId         String
+  mode           ReceiptMode
+  quantity       Int
+  handlingUnitId String?
+  locationId     String
+  userId         String
+  createdAt      DateTime    @default(now())
+
+  line         GoodsReceiptLine @relation(fields: [lineId], references: [id], onDelete: Cascade)
+  handlingUnit HandlingUnit?    @relation(fields: [handlingUnitId], references: [id])
+  user         User             @relation(fields: [userId], references: [id])
+}
+
+// ─── Wydania (WZ) ───────────────────────────────────────────────────────────
+
+enum IssueStatus {
+  DRAFT
+  CONFIRMED
+  CANCELLED
+}
+
+model GoodsIssue {
+  id          String      @id @default(cuid())
+  number      String      @unique
+  customerId  String
+  status      IssueStatus @default(DRAFT)
+  issueDate   DateTime    @default(now())
+  notes       String?
+  createdById String
+  createdAt   DateTime    @default(now())
+  confirmedAt DateTime?
+  invoiceId   String?
+
+  customer  Contractor       @relation(fields: [customerId], references: [id])
+  createdBy User             @relation("IssueCreatedBy", fields: [createdById], references: [id])
+  lines     GoodsIssueLine[]
+  invoice   Invoice?         @relation(fields: [invoiceId], references: [id])
+
+  @@index([status])
+  @@index([invoiceId])
+}
+
+model GoodsIssueLine {
+  id        String @id @default(cuid())
+  issueId   String
+  productId String
+  quantity  Int
+  /// cena sprzedaży netto (grosze)
+  unitPrice Int
+  vatRate   Int
+  /// koszt (średni ważony) w momencie wydania — wartość WZ w cenach zakupu
+  unitCost  Int    @default(0)
+
+  issue       GoodsIssue        @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  product     Product           @relation(fields: [productId], references: [id])
+  allocations IssueAllocation[]
+}
+
+/// Skąd fizycznie pobrano towar przy wydaniu
+model IssueAllocation {
+  id             String    @id @default(cuid())
+  lineId         String
+  locationCode   String
+  handlingUnitCode String?
+  batch          String?
+  expiryDate     DateTime?
+  quantity       Int
+
+  line GoodsIssueLine @relation(fields: [lineId], references: [id], onDelete: Cascade)
+}
+
+// ─── Faktury ────────────────────────────────────────────────────────────────
+
+enum InvoiceType {
+  SALES
+  PURCHASE
+}
+
+enum InvoiceStatus {
+  ISSUED
+  PAID
+  CANCELLED
+}
+
+enum PaymentMethod {
+  TRANSFER
+  CASH
+  CARD
+}
+
+model Invoice {
+  id             String        @id @default(cuid())
+  number         String        @unique
+  type           InvoiceType
+  /// numer faktury nadany przez dostawcę (faktury zakupowe)
+  externalNumber String?
+  contractorId   String
+  issueDate      DateTime
+  saleDate       DateTime
+  dueDate        DateTime
+  paymentMethod  PaymentMethod @default(TRANSFER)
+  status         InvoiceStatus @default(ISSUED)
+  paidAt         DateTime?
+  netTotal       Int
+  vatTotal       Int
+  grossTotal     Int
+  notes          String?
+  createdById    String
+  createdAt      DateTime      @default(now())
+
+  contractor  Contractor    @relation(fields: [contractorId], references: [id])
+  createdBy   User          @relation("InvoiceCreatedBy", fields: [createdById], references: [id])
+  lines       InvoiceLine[]
+  goodsIssues GoodsIssue[]
+  receipt     GoodsReceipt?
+
+  @@index([type, issueDate])
+  @@index([status])
+}
+
+model InvoiceLine {
+  id        String  @id @default(cuid())
+  invoiceId String
+  productId String?
+  name      String
+  unit      String
+  quantity  Int
+  unitNet   Int
+  vatRate   Int
+  net       Int
+  vat       Int
+  gross     Int
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id])
+}
+
+// ─── Numeracja dokumentów ───────────────────────────────────────────────────
+
+model DocumentSequence {
+  prefix String
+  year   Int
+  month  Int
+  last   Int    @default(0)
+
+  @@id([prefix, year, month])
+}
